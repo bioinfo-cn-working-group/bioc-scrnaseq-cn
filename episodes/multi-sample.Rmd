@@ -1,0 +1,656 @@
+---
+title: Multi-sample analyses
+teaching: 30 # Minutes of teaching in the lesson
+exercises: 15 # Minutes of exercises in the lesson
+---
+
+:::::::::::::::::::::::::::::::::::::: questions 
+
+- How can we integrate data from multiple batches, samples, and studies?
+- How can we identify differentially expressed genes between experimental conditions for each cell type?
+- How can we identify changes in cell type abundance between experimental conditions?
+
+::::::::::::::::::::::::::::::::::::::::::::::::
+
+::::::::::::::::::::::::::::::::::::: objectives
+
+- Correct batch effects and diagnose potential problems such as over-correction.
+- Perform differential expression comparisons between conditions based on pseudo-bulk samples.
+- Perform differential abundance comparisons between conditions.
+
+::::::::::::::::::::::::::::::::::::::::::::::::
+
+
+## Setup and data exploration
+
+As before, we will use the the wild-type data from the Tal1 chimera experiment:
+
+- Sample 5: E8.5 injected cells (tomato positive), pool 3
+- Sample 6: E8.5 host cells (tomato negative), pool 3
+- Sample 7: E8.5 injected cells (tomato positive), pool 4
+- Sample 8: E8.5 host cells (tomato negative), pool 4
+- Sample 9: E8.5 injected cells (tomato positive), pool 5
+- Sample 10: E8.5 host cells (tomato negative), pool 5
+
+Note that this is a paired design in which for each biological replicate (pool 3, 4, and 5), we have both host and injected cells.
+
+We start by loading the data and doing a quick exploratory analysis, essentially applying the normalization and visualization techniques that we have seen in the previous lectures to all samples. Note that this time we're selecting samples 5 to 10, not just 5 by itself. Also note the `type = "processed"` argument: we are explicitly selecting the version of the data that has already been QC processed.
+
+```{r chunk-opts, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(BiocStyle)
+```
+
+```{r setup}
+library(MouseGastrulationData)
+library(batchelor)
+library(edgeR)
+library(scater)
+library(ggplot2)
+library(scran)
+library(pheatmap)
+library(scuttle)
+
+sce <- WTChimeraData(samples = 5:10, type = "processed")
+
+sce
+
+colData(sce)
+```
+
+For the sake of making these examples run faster, we drop low quality cells (stripped nuclei and doublets) and also randomly select 50% cells per sample.
+
+```{r}
+drop <- sce$celltype.mapped %in% c("stripped", "Doublet")
+
+sce <- sce[,!drop]
+
+set.seed(29482)
+
+idx <- unlist(tapply(colnames(sce), sce$sample, function(x) {
+    perc <- round(0.50 * length(x))
+    sample(x, perc)
+}))
+
+sce <- sce[,idx]
+```
+
+We now normalize the data, run some dimensionality reduction steps, and visualize the data in a tSNE plot. In this case we have many different cell types, so we define a custom palette with many visually distinct colors (adapted from the `polychrome` palette in the [`pals` package](https://cran.r-project.org/web/packages/pals/vignettes/pals_examples.html)). 
+
+```{r}
+sce <- logNormCounts(sce)
+
+dec <- modelGeneVar(sce, block = sce$sample)
+
+chosen.hvgs <- dec$bio > 0
+
+sce <- runPCA(sce, subset_row = chosen.hvgs, ntop = 1000)
+
+sce <- runTSNE(sce, dimred = "PCA")
+
+sce$sample <- as.factor(sce$sample)
+
+plotTSNE(sce, colour_by = "sample")
+
+color_vec <- c("#5A5156", "#E4E1E3", "#F6222E", "#FE00FA", "#16FF32", "#3283FE", 
+               "#FEAF16", "#B00068", "#1CFFCE", "#90AD1C", "#2ED9FF", "#DEA0FD", 
+               "#AA0DFE", "#F8A19F", "#325A9B", "#C4451C", "#1C8356", "#85660D", 
+               "#B10DA1", "#3B00FB", "#1CBE4F", "#FA0087", "#333333", "#F7E1A0", 
+               "#C075A6", "#782AB6", "#AAF400", "#BDCDFF", "#822E1C", "#B5EFB5", 
+               "#7ED7D1", "#1C7F93", "#D85FF7", "#683B79", "#66B0FF", "#FBE426")
+
+plotTSNE(sce, colour_by = "celltype.mapped") +
+    scale_color_manual(values = color_vec) +
+    theme(legend.position = "bottom")
+```
+
+There are evident sample effects. Depending on the analysis that you want to perform you may want to remove or retain the sample effect. For instance, if the goal is to identify cell types with a clustering method, one may want to remove the sample effects with "batch effect" correction methods.
+
+For now, let's assume that we want to remove this effect.
+
+:::: challenge
+
+It seems like samples 5 and 6 are clearly separated off the other samples in gene expression space. Given the group of cells in each sample, why might this make sense for these samples as opposed to some other pair of samples? What is the factor presumably leading to this difference?
+
+::: solution
+
+Samples 5 and 6 were from the same "pool" of cells. Looking at the documentation for the dataset under `?WTChimeraData` we see that the pool variable is defined as: "Integer, embryo pool from which cell derived; samples with same value are matched." So samples 5 and 6 have an experimental factor in common which causes a shared, systematic difference in their gene expression profiles compared to the other samples. That's why you can see many isolated blue/orange clusters on the first TSNE plot. If you were developing single-cell library preparation protocols you might want to preserve this effect to understand how variation in pools leads to variation in expression, but for now, given that we're investigating other effects, we'll want to remove this as undesired technical variation.
+
+:::
+
+::::
+
+## Correcting batch effects
+
+We "correct" the effect of samples with the `correctExperiment` function
+in the `batchelor` package, using the `sample` column as the batch variable.
+
+
+```{r}
+set.seed(10102)
+
+merged <- correctExperiments(
+    sce, 
+    batch = sce$sample, 
+    subset.row = chosen.hvgs,
+    PARAM = FastMnnParam(
+        merge.order = list(
+            list(1,3,5), # WT (3 replicates)
+            list(2,4,6)  # td-Tomato (3 replicates)
+        )
+    )
+)
+
+merged <- runTSNE(merged, dimred = "corrected")
+
+plotTSNE(merged, colour_by = "batch")
+```
+
+We can also see that when coloring cells by cell type, the cell types are now largely confined to individual clusters:
+
+```{r}
+plotTSNE(merged, colour_by = "celltype.mapped") +
+    scale_color_manual(values = color_vec) +
+    theme(legend.position = "bottom")
+```
+
+
+Once we have removed the sample effect, we can proceed with the differential 
+expression (DE) analysis.
+
+:::: challenge
+
+True or False? After batch correction, no batch-level information is present in the corrected data.
+
+::: solution
+
+False. Batch-level data can be retained through confounding with experimental factors or poor ability to distinguish experimental effects from batch effects. Remember, the changes needed to correct the data are empirically estimated, so they can carry along error. 
+
+While batch effect correction algorithms usually do a pretty good job, it's smart to do a sanity check for batch effects at the end of your analysis. You always want to make sure that that effect you're resting your paper submission on isn't driven by batch effects.
+
+:::
+
+::::
+
+
+## Differential Expression
+
+In order to perform a differential expression (DE) analysis, we need to identify
+groups of cells across samples/conditions (depending on the experimental 
+design and the overall goal of the experiment). 
+
+As we have seen before, there are two ways of grouping cells, cell clustering and cell
+labeling. Here, we apply the second approach to group cells
+according to the already annotated cell types to proceed with the computation of
+the pseudo-bulk samples.
+
+### Pseudo-bulk samples
+
+To compute differences between groups of cells, a possible way is to compute
+pseudo-bulk samples, where we summarize the gene expression for all the cells of each
+specific cell type. We are then able to detect differences in gene expression 
+between two different conditions for one cell type at a time.
+
+To compute pseudo-bulk samples, we use the `aggregateAcrossCells` function in the 
+`scuttle` package, which takes as input not only a SingleCellExperiment, 
+but also the label used for the identification of cell groups/types.
+Here, we use as not just the cell type label, but also the sample ID, as
+we want be able to discern between replicates and conditions later in the analysis.
+
+```{r}
+# Using 'label' and 'sample' as our two factors; each column of the output
+# corresponds to one unique combination of these two factors.
+
+summed <- aggregateAcrossCells(
+    merged, 
+    id = colData(merged)[,c("celltype.mapped", "sample")]
+)
+
+summed
+```
+
+### Differential Expression (DE) Analysis
+
+The main advantage of using pseudo-bulk samples is that we can use
+established methods for bulk DE analysis like 
+[edgeR](https://bioconductor.org/packages/edgeR) and
+[DESeq2](https://bioconductor.org/packages/DESeq2). Both, 
+[edgeR](https://bioconductor.org/packages/edgeR) and
+[DESeq2](https://bioconductor.org/packages/DESeq2),
+are based on negative binomial models, but differ in their normalization strategies
+and several implementation details.
+
+First, let's start with a specific cell type, for instance the "Mesenchymal stem
+cells", and analyze gene expression differences between conditions for this cell type.
+We store the counts table in a `DGEList` data container called `y`, along with experimental
+metadata.
+
+```{r}
+current <- summed[, summed$celltype.mapped == "Mesenchyme"]
+
+y <- DGEList(counts(current), samples = colData(current))
+
+y
+```
+
+We usually want to discard low quality samples with low sequencing depth / library
+size as they have the potential to skew normalization and/or DE analysis.
+
+We can see that in our case we don't have low quality samples, so there is no need
+for such a filtering step.
+
+```{r}
+discarded <- current$ncells < 10
+
+y <- y[,!discarded]
+
+summary(discarded)
+```
+
+Typically, we also want to filter out genes
+with too low of an expression to be meaningfully retained in a statistcal analysis
+for differential expression.
+
+```{r}
+keep <- filterByExpr(y, group = current$tomato)
+
+y <- y[keep,]
+
+summary(keep)
+```
+
+We can now proceed with normalizing the data. There are several approaches for
+normalizing bulk data, that are thus readily applicable to pseudo-bulk data.
+Here, we use the Trimmed Mean of *M*-values (TMM) method, implemented in the
+`edgeR` package within the `calcNormFactors` function.
+
+```{r}
+y <- calcNormFactors(y)
+
+y$samples
+```
+
+To investigate the effect of the normalization, we use a Mean-Difference (MD)
+plot for each sample in order to detect possible normalization issues due to
+insufficient cells/reads/UMIs in any of the pseudo-bulk profiles.
+
+In our case, we verify that all these plots are centered on 0 ($y$-axis) and
+display a trumpet shape, as expected.
+
+
+```{r}
+par(mfrow = c(2,3))
+
+for (i in seq_len(ncol(y))) {
+    plotMD(y, column = i)
+}
+
+par(mfrow = c(1,1))
+```
+
+Furthermore, we want to check if the samples cluster together based
+on known experimental factors (like the tomato injection in this case).
+
+Here, we use a multidimensional scaling (MDS) plot to inspect this.
+Multidimensional scaling (also called principal *coordinate* analysis (PCoA)) is a dimensionality reduction technique that's conceptually similar to principal *component* analysis (PCA).
+    
+```{r}
+limma::plotMDS(cpm(y, log = TRUE), 
+               col = ifelse(y$samples$tomato, "red", "blue"))
+```
+
+We then construct a design matrix with the tomato variable as the main factors and pool
+as an additional covariate.
+
+```{r}
+design <- model.matrix(~factor(pool) + factor(tomato),
+                       data = y$samples)
+design
+```
+
+Now we can estimate the Negative Binomial (NB) overdispersion parameter, to model
+the mean-variance trend.
+
+```{r}
+y <- estimateDisp(y, design)
+
+summary(y$trended.dispersion)
+```
+
+The BCV plot allows us to visualize the relationship between the Biological Coefficient
+of Variation and the Average log CPM for each gene.
+Additionally, the Common and Trend BCV are shown in `red` and `blue`.
+
+```{r}
+plotBCV(y)
+```
+
+We then fit a Quasi-Likelihood (QL) negative binomial generalized linear model for each gene. 
+The `robust = TRUE` parameter avoids distortions from highly variable clusters.
+The QL method includes an additional dispersion parameter for incorporating the uncertainty and variability of the per-gene variance, which is not well estimated by the NB dispersions, so the two dispersion types complement each other in the final analysis.
+
+```{r}
+fit <- glmQLFit(y, design, robust = TRUE)
+
+summary(fit$var.prior)
+
+summary(fit$df.prior)
+```
+
+QL dispersion estimates for each gene as a function of abundance. Raw estimates (black) are shrunk towards the trend (blue) to yield squeezed estimates (red).
+
+```{r}
+plotQLDisp(fit)
+```
+
+We then use an empirical Bayes quasi-likelihood *F*-test to test for differential expression (due to tomato injection) for each gene at a False Discovery Rate (FDR) of 5%.
+The low number of DE genes shwos that tomato injection does not have a major impact on gene expression in mesenchymal cells.
+
+```{r}
+res <- glmQLFTest(fit, coef = ncol(design))
+
+summary(decideTests(res))
+
+topTags(res)
+```
+
+All the previous steps can be conveniently performed for each cell type, with
+the `pseudoBulkDGE` function from the [scran](https://bioconductor.org/packages/scran)
+package.
+
+```{r}
+summed.filt <- summed[,summed$ncells >= 10]
+
+de.results <- pseudoBulkDGE(
+    summed.filt, 
+    label = summed.filt$celltype.mapped,
+    design = ~factor(pool) + tomato,
+    coef = "tomatoTRUE",
+    condition = summed.filt$tomato 
+)
+```
+
+The returned object is a list of `DataFrame`s each storing the results for one of the cell types.
+Each of these `DataFrame`s also contains the intermediate results of the full [edgeR](https://bioconductor.org/packages/edgeR) pipeline carried out above, which allows us to apply diagnostics and visualization of individual steps of the pipeline.
+
+```{r}
+cur.results <- de.results[["Allantois"]]
+
+cur.results[order(cur.results$PValue),]
+```
+
+:::: challenge
+
+Clearly some of the results have low *p*-values. What about the effect sizes? What does `logFC` stand for?
+
+::: solution
+
+"logFC" stands for log fold-change, typically on a log2 scale. That means a 2-fold increase in gene expression corresponds to a logFC of log2(2) = 1. 
+
+`ENSMUSG00000037664` seems to have an estimated logFC of about -8. That points to a large decrease in expression of that gene in Allantois cells of the tomato positive samples.
+
+:::
+
+::::
+
+
+## Differential Abundance (DA) analysis
+
+In addition to differences in gene expression, we also want to find differences
+in cell type *abundance* between conditions (here in tomato positive vs wild type
+samples).
+
+Therefore, we first quantify the number of cells for each cell type, and then
+fit a model to detect differences between the injected cells and the background.
+
+This process is very similar to differential expression analysis, but here we
+apply the analysis on the computed abundances without normalizing the data first.
+
+```{r}
+abundances <- table(merged$celltype.mapped, merged$sample) 
+
+abundances <- unclass(abundances) 
+
+extra.info <- colData(merged)[match(colnames(abundances), merged$sample),]
+
+y.ab <- DGEList(abundances, samples = extra.info)
+
+design <- model.matrix(~factor(pool) + factor(tomato), y.ab$samples)
+
+y.ab <- estimateDisp(y.ab, design, trend = "none")
+
+fit.ab <- glmQLFit(y.ab, design, robust = TRUE, abundance.trend = FALSE)
+```
+
+### Background on compositional effect
+
+We don't normalize the abundance data with the `calcNormFactors` function, as this would
+implicitly work under the assumption that most of the input features do not
+vary between conditions. This is typically not a reasonable assumption for
+cell type abundances as we often only have a few different cell populations that
+all can change with different experimental conditions.
+This means that here we will not normalize for library size, which in abundance
+data corresponds to the total number of cells in each sample (cell type).
+
+However, this can lead our data to be susceptible to compositional
+effects. "Compositional" refers to the fact that the cluster abundances in a
+sample are not independent of one another because each cell type is effectively
+competing for space in the sample. They behave like proportions in that they
+must sum to 1. If the abundance of cell type A increases under a certain condition,
+we consequenlty observe less abundance of all other cell types,
+even if all other cell types are not directly affected by this condition.
+
+Not accounting for compositionality means that any conclusions derived from the DA
+analysis can be biased by the amount of cells present for each cell type.
+And it is not uncommon that the number of cells can be strongly unbalanced between
+cell types, with some low abundance cell types comprising close to 0 percent and
+certain high abundance cell types making up close to 100 percent of all cells in 
+a sample.
+
+We now look at different approaches for handling the compositional effect.
+
+### Assuming most labels do not change
+
+We can use a similar approach as for the DE analysis, assuming that most
+labels are not changing, in particular if we consider the fact that only few genes
+where found to be differentially expressed in the analysis above.
+
+To do so, we first normalize the data with `calcNormFactors` and then we fit and 
+estimate a QL-model for the abundance data.
+
+```{r}
+y.ab2 <- calcNormFactors(y.ab)
+
+y.ab2$samples$norm.factors
+```
+
+We then use functions from [edgeR](https://bioconductor.org/packages/edgeR) as before: 
+
+```{r}
+y.ab2 <- estimateDisp(y.ab2, design, trend = "none")
+
+fit.ab2 <- glmQLFit(y.ab2, design, robust = TRUE, abundance.trend = FALSE)
+
+res2 <- glmQLFTest(fit.ab2, coef = ncol(design))
+
+summary(decideTests(res2))
+
+topTags(res2, n = 10)
+```
+
+###  Testing against a log-fold change threshold
+
+An alternative approach assumes that the composition bias introduces a spurious
+log2-fold change of no more than a \tau quantity for a non-DA label.
+
+In other words, we interpret this as the maximum log-fold change in the total
+number of cells given by DA in other labels. On the other hand, when choosing
+\tau, we should not consider fold-differences in the totals due to differences
+in capture efficiency or for the case that the size of the original cell population is not
+attributable to composition bias. We then mitigate the effect of composition
+biases by testing each label for changes in abundance beyond \tau.
+
+```{r}
+res.lfc <- glmTreat(fit.ab, coef = ncol(design), lfc = 1)
+
+summary(decideTests(res.lfc))
+
+topTags(res.lfc)
+```
+
+Addionally, the choice of \tau can be guided by other external experimental data, like a previous or a pilot experiment.
+
+## Exercises
+
+
+:::::::::::::::::::::::::::::::::: challenge
+
+#### Exercise 1: Heatmaps
+
+Use the `pheatmap` package to create a heatmap of the abundances table. Does it comport with the model results?
+
+:::::::::::::: hint
+
+You can simply hand `pheatmap()` a matrix as its only argument. `pheatmap()` has a million options you can adjust, but the defaults are usually pretty good. Try to overlay sample-level information with the `annotation_col` argument for an extra challenge.
+
+:::::::::::::::::::::::
+
+:::::::::::::: solution
+
+```{r}
+pheatmap(y.ab$counts)
+
+anno_df <- y.ab$samples[,c("tomato", "pool")]
+
+anno_df$pool = as.character(anno_df$pool)
+
+anno_df$tomato <- ifelse(anno_df$tomato,
+                         "tomato+",
+                         "tomato-")
+
+pheatmap(y.ab$counts,
+         annotation_col = anno_df)
+```
+
+The top DA result was a decrease in ExE ectoderm in the tomato condition, which you can sort of see, especially if you `log1p()` the counts or discard rows that show much higher values. ExE ectoderm counts were much higher in samples 8 and 10 compared to 5, 7, and 9. 
+
+:::::::::::::::::::::::
+
+:::::::::::::::::::::::::::::::::::::::::::::
+
+:::::::::::::::::::::::::::::::::: challenge
+
+#### Exercise 2: Model specification and comparison
+
+Try re-running the pseudobulk DGE without the `pool` factor in the design specification. Compare the logFC estimates and the distribution of p-values for the `Erythroid3` cell type.
+
+:::::::::::::: hint
+
+After running the second pseudobulk DGE, you can join the two `DataFrame`s of `Erythroid3` statistics using the `merge()` function. You will need to create a common key column from the gene IDs.
+
+:::::::::::::::::::::::
+
+:::::::::::::: solution
+
+
+```{r}
+de.results2 <- pseudoBulkDGE(
+    summed.filt, 
+    label = summed.filt$celltype.mapped,
+    design = ~tomato,
+    coef = "tomatoTRUE",
+    condition = summed.filt$tomato 
+)
+
+eryth1 <- de.results$Erythroid3
+
+eryth2 <- de.results2$Erythroid3
+
+eryth1$gene <- rownames(eryth1)
+
+eryth2$gene <- rownames(eryth2)
+
+comp_df <- merge(eryth1, eryth2, by = 'gene')
+
+comp_df <- comp_df[!is.na(comp_df$logFC.x),]
+
+ggplot(comp_df, aes(logFC.x, logFC.y)) + 
+    geom_abline(lty = 2, color = "grey") +
+    geom_point() 
+    
+# Reshape to long format for ggplot facets. This is 1000x times easier to do
+# with tidyverse packages:
+pval_df <- reshape(comp_df[,c("gene", "PValue.x", "PValue.y")],
+                   direction = "long", 
+                   v.names = "Pvalue",
+                   timevar = "pool_factor",
+                   times = c("with pool factor", "no pool factor"),
+                   varying = c("PValue.x", "PValue.y"))
+
+ggplot(pval_df, aes(Pvalue)) + 
+    geom_histogram(boundary = 0,
+                   bins = 30) + 
+    facet_wrap("pool_factor")
+```
+
+We can see that in this case, the logFC estimates are strongly consistent between the two models, which tells us that the inclusion of the `pool` factor in the model doesn't strongly influence the estimate of the `tomato` coefficients in this case.
+
+The p-value histograms both look alright here, with a largely flat plateau over most of the 0 - 1 range and a spike near 0. This is consistent with the hypothesis that most genes are unaffected by `tomato` but there are a small handful that clearly are. 
+
+If there were large shifts in the logFC estimates or p-value distributions, that's a sign that the design specification change has a large impact on how the model sees the data. If that happens, you'll need to think carefully and critically about what variables should and should not be included in the model formula.
+
+:::::::::::::::::::::::
+
+:::::::::::::::::::::::::::::::::::::::::::::
+
+:::: challenge
+
+#### Extension challenge 1: Group effects
+
+Having multiple independent samples in each experimental group is always helpful, but it's particularly important when it comes to batch effect correction. Why?
+
+::: solution
+
+It's important to have multiple samples within each experimental group because it helps the batch effect correction algorithm distinguish differences due to batch effects (uninteresting) from differences due to group/treatment/biology (interesting). 
+
+Imagine you had one sample that received a drug treatment and one that did not, each with 10,000 cells. They differ substantially in expression of gene X. Is that an important scientific finding? You can't tell for sure, because the effect of drug is indistinguishable from a sample-wise batch effect. But if the difference in gene X holds up when you have five treated samples and five untreated samples, now you can be a bit more confident. Many batch effect correction methods will take information on experimental factors as additional arguments, which they can use to help remove batch effects while retaining experimental differences.
+
+:::
+
+::::
+
+:::::::::::::: checklist
+## Further Reading
+
+* OSCA book, Multi-sample analysis, [Chapters 1, 4, and 6](https://bioconductor.org/books/release/OSCA.multisample)
+
+::::::::::::::
+
+::::::::::::::::::::::::::::::::::::: keypoints 
+-   Batch effects are systematic technical differences in the observed expression
+    in cells measured in different experimental batches.
+-   Computational removal of batch-to-batch variation with the `correctExperiment`
+    function from the `r Biocpkg("batchelor")` package allows us to combine data
+    across multiple batches for a consolidated downstream analysis.
+-   Differential expression (DE) analysis of replicated multi-condition scRNA-seq experiments
+    is typically based on pseudo-bulk expression profiles, generated by summing
+    counts for all cells with the same combination of label and sample.
+-   The `aggregateAcrossCells` function from the `r Biocpkg("scater")` package
+    facilitates the creation of pseudo-bulk samples.   
+-   The `pseudoBulkDGE` function from the `r Biocpkg("scran")` package can be used
+    to detect significant changes in expression between conditions for pseudo-bulk samples
+    consisting of cells of the same type.
+-   Differential abundance (DA) analysis aims at identifying significant changes in
+    cell type abundance across conditions.
+-   DA analysis uses bulk DE methods such as `r Biocpkg("edgeR")` and `r Biocpkg("DESeq2")`,
+    which provide suitable statistical models for count data in the presence of
+    limited replication - except that the counts are not of reads per gene, but
+    of cells per label.
+::::::::::::::::::::::::::::::::::::::::::::::::
+
+## Session Info
+
+```{r, tidy=TRUE}
+sessionInfo()
+```
+
